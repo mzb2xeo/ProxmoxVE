@@ -3118,32 +3118,93 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Installs or updates MariaDB from official repo.
+# Installs or updates MariaDB.
 #
 # Description:
+#   - By default uses distro repository (Debian/Ubuntu apt) for stability
+#   - Optionally uses official MariaDB repository for latest versions
 #   - Detects current MariaDB version and replaces it if necessary
 #   - Preserves existing database data
-#   - Dynamically determines latest GA version if "latest" is given
 #
 # Variables:
-#   MARIADB_VERSION - MariaDB version to install (e.g. 10.11, latest) (default: latest)
+#   USE_MARIADB_REPO - Set to "true" to use official MariaDB repository
+#                      (default: false, uses distro packages)
+#   MARIADB_VERSION  - MariaDB version to install when using official repo
+#                      (e.g. 11.4, latest) (default: latest)
+#
+# Examples:
+#   setup_mariadb                              # Uses distro package (recommended)
+#   USE_MARIADB_REPO=true setup_mariadb        # Uses latest from official repo
+#   USE_MARIADB_REPO=true MARIADB_VERSION="11.4" setup_mariadb  # Specific version
 # ------------------------------------------------------------------------------
 
 setup_mariadb() {
-  local MARIADB_VERSION="${MARIADB_VERSION:-latest}"
+  local MARIADB_VERSION="${MARIADB_VERSION:-}"
+  local USE_MARIADB_REPO="${USE_MARIADB_REPO:-false}"
 
-  # Resolve "latest" to actual version
-  if [[ "$MARIADB_VERSION" == "latest" ]]; then
+  # Get currently installed version
+  local CURRENT_VERSION=""
+  CURRENT_VERSION=$(is_tool_installed "mariadb" 2>/dev/null) || true
+
+  # Scenario 1: Use distro repository (default, most stable)
+  if [[ "$USE_MARIADB_REPO" != "true" && "$USE_MARIADB_REPO" != "TRUE" && "$USE_MARIADB_REPO" != "1" ]]; then
+    msg_info "Setup MariaDB (distro package)"
+
+    # If already installed, just update
+    if [[ -n "$CURRENT_VERSION" ]]; then
+      msg_info "Update MariaDB $CURRENT_VERSION"
+      ensure_apt_working || return 1
+      upgrade_packages_with_retry "mariadb-server" "mariadb-client" || {
+        msg_error "Failed to upgrade MariaDB packages"
+        return 1
+      }
+      cache_installed_version "mariadb" "$CURRENT_VERSION"
+      msg_ok "Update MariaDB $CURRENT_VERSION"
+      return 0
+    fi
+
+    # Fresh install from distro repo
+    ensure_apt_working || return 1
+
+    # Install required dependencies first
+    local mariadb_deps=()
+    for dep in gawk rsync socat libdbi-perl pv; do
+      if apt-cache search "^${dep}$" 2>/dev/null | grep -q .; then
+        mariadb_deps+=("$dep")
+      fi
+    done
+
+    if [[ ${#mariadb_deps[@]} -gt 0 ]]; then
+      $STD apt install -y "${mariadb_deps[@]}" 2>/dev/null || true
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    install_packages_with_retry "mariadb-server" "mariadb-client" || {
+      msg_error "Failed to install MariaDB packages from distro repository"
+      return 1
+    }
+
+    # Get installed version
+    local INSTALLED_VERSION=""
+    INSTALLED_VERSION=$(is_tool_installed "mariadb" 2>/dev/null) || true
+    cache_installed_version "mariadb" "${INSTALLED_VERSION:-distro}"
+    msg_ok "Setup MariaDB ${INSTALLED_VERSION:-from distro}"
+    return 0
+  fi
+
+  # Scenario 2: Use official MariaDB repository (USE_MARIADB_REPO=true)
+  # Resolve "latest" to actual version if not specified
+  if [[ -z "$MARIADB_VERSION" || "$MARIADB_VERSION" == "latest" ]]; then
     if ! curl -fsI --max-time 10 http://mirror.mariadb.org/repo/ >/dev/null 2>&1; then
       msg_warn "MariaDB mirror not reachable - trying mariadb_repo_setup fallback"
       # Try using official mariadb_repo_setup script as fallback
       if curl -fsSL --max-time 15 https://r.mariadb.com/downloads/mariadb_repo_setup 2>/dev/null | bash -s -- --skip-verify >/dev/null 2>&1; then
         msg_ok "MariaDB repository configured via mariadb_repo_setup"
         # Extract version from configured repo
-        MARIADB_VERSION=$(grep -oP 'repo/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/apt/sources.list.d/mariadb.list 2>/dev/null | head -n1 || echo "12.2")
+        MARIADB_VERSION=$(grep -oP 'repo/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/apt/sources.list.d/mariadb.list 2>/dev/null | head -n1 || echo "11.4")
       else
         msg_warn "mariadb_repo_setup failed - using hardcoded fallback version"
-        MARIADB_VERSION="12.2"
+        MARIADB_VERSION="11.4"
       fi
     else
       MARIADB_VERSION=$(curl -fsSL --max-time 15 http://mirror.mariadb.org/repo/ 2>/dev/null |
@@ -3157,20 +3218,16 @@ setup_mariadb() {
         msg_warn "Could not parse latest GA MariaDB version from mirror - trying mariadb_repo_setup"
         if curl -fsSL --max-time 15 https://r.mariadb.com/downloads/mariadb_repo_setup 2>/dev/null | bash -s -- --skip-verify >/dev/null 2>&1; then
           msg_ok "MariaDB repository configured via mariadb_repo_setup"
-          MARIADB_VERSION=$(grep -oP 'repo/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/apt/sources.list.d/mariadb.list 2>/dev/null | head -n1 || echo "12.2")
+          MARIADB_VERSION=$(grep -oP 'repo/\K[0-9]+\.[0-9]+\.[0-9]+' /etc/apt/sources.list.d/mariadb.list 2>/dev/null | head -n1 || echo "11.4")
         else
           msg_warn "mariadb_repo_setup failed - using hardcoded fallback version"
-          MARIADB_VERSION="12.2"
+          MARIADB_VERSION="11.4"
         fi
       fi
     fi
   fi
 
-  # Get currently installed version
-  local CURRENT_VERSION=""
-  CURRENT_VERSION=$(is_tool_installed "mariadb" 2>/dev/null) || true
-
-  # Scenario 1: Already installed at target version - just update packages
+  # Scenario 2a: Already installed at target version - just update packages
   if [[ -n "$CURRENT_VERSION" && "$CURRENT_VERSION" == "$MARIADB_VERSION" ]]; then
     msg_info "Update MariaDB $MARIADB_VERSION"
 
@@ -3202,14 +3259,14 @@ setup_mariadb() {
     return 0
   fi
 
-  # Scenario 2: Different version installed - clean upgrade
+  # Scenario 2b: Different version installed - clean upgrade
   if [[ -n "$CURRENT_VERSION" && "$CURRENT_VERSION" != "$MARIADB_VERSION" ]]; then
     msg_info "Upgrade MariaDB from $CURRENT_VERSION to $MARIADB_VERSION"
     remove_old_tool_version "mariadb"
   fi
 
-  # Scenario 3: Fresh install or version change
-  msg_info "Setup MariaDB $MARIADB_VERSION"
+  # Scenario 2c: Fresh install or version change from official repo
+  msg_info "Setup MariaDB $MARIADB_VERSION (official repository)"
 
   # Prepare repository (cleanup + validation)
   prepare_repository_setup "mariadb" || {
